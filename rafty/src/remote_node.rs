@@ -1,3 +1,6 @@
+use crate::cluster::{
+    ClusterConfiguration, ClusterId, ClusterMember, ClusterMembership, NodeAddress,
+};
 use crate::node_state::NodeId;
 use crate::transport::model::command::Command;
 use crate::transport::model::common::{
@@ -6,11 +9,14 @@ use crate::transport::model::common::{
 use crate::transport::model::log::{LogReplicationRequest, LogReplicationResponse};
 use crate::transport::model::vote::{VoteRequest, VoteResponse};
 use crate::transport::model::{ClusterMessage, NodeAware};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+use log::warn;
 use std::collections::HashMap;
+use std::collections::hash_map::Keys;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +48,7 @@ pub trait LeaderClient: Debug + Send + Sync {
     ) -> ClusterMessage<HeartbeatResponse>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RemoteNode {
     candidate_client: Arc<dyn CandidateClient>,
     follower_client: Arc<dyn FollowerClient>,
@@ -67,10 +73,11 @@ impl RemoteNode {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ClusterClient {
     node_id: NodeId,
-    remote_nodes: Arc<HashMap<NodeId, RemoteNode>>,
+    membership: Arc<ClusterMembership>,
+    remote_nodes: ArcSwap<HashMap<NodeId, RemoteNode>>,
     max_timeout: Duration,
 }
 
@@ -79,8 +86,6 @@ fn accept_all<T>(_response: &T) -> bool {
 }
 
 impl ClusterClient {
-    const QUORUM_MULTIPLIER: usize = 2;
-
     fn _empty_map<K, V>() -> HashMap<K, V> {
         HashMap::<K, V>::with_capacity(0)
     }
@@ -90,19 +95,61 @@ impl ClusterClient {
         remote_nodes: Arc<HashMap<NodeId, RemoteNode>>,
         max_timeout: Duration,
     ) -> Self {
-        ClusterClient {
+        let members = remote_nodes
+            .keys()
+            .filter(|id| **id != node_id)
+            .chain(std::iter::once(&node_id))
+            .map(|id| ClusterMember::voter(id.clone(), NodeAddress::placeholder(id)));
+
+        let configuration =
+            ClusterConfiguration::new(ClusterId::new("anonymous").expect("static"), 0, members)
+                .expect("in-memory cluster configuration is valid");
+        Self::with_membership(
             node_id,
+            Arc::new(ClusterMembership::new(configuration)),
             remote_nodes,
+            max_timeout,
+        )
+    }
+
+    pub fn with_membership(
+        node_id: NodeId,
+        membership: Arc<ClusterMembership>,
+        remote_nodes: Arc<HashMap<NodeId, RemoteNode>>,
+        max_timeout: Duration,
+    ) -> Self {
+        Self {
+            node_id,
+            membership,
+            remote_nodes: ArcSwap::from(remote_nodes),
             max_timeout,
         }
     }
 
+    pub fn configuration(&self) -> Arc<ClusterConfiguration> {
+        self.membership.configuration()
+    }
+
+    pub fn register_remote(&self, node_id: NodeId, remote: RemoteNode) {
+        let current = self.remote_nodes.load_full();
+        let mut next = (*current).clone();
+        next.insert(node_id, remote);
+        self.remote_nodes.store(Arc::new(next));
+    }
+
     pub async fn heartbeat(&self, request: ClusterMessage<HeartbeatRequest>) -> Result<()> {
+        let expected = self
+            .remote_nodes
+            .load()
+            .keys()
+            .filter(|id| **id != self.node_id)
+            .count();
         self.broadcast_call(
             &request,
             async |node, req| node.leader_client.heartbeat(req).await,
             accept_all,
-            |succeeded_responses| succeeded_responses == self.remote_nodes.len(),
+            move |succeeded| succeeded.len() >= expected,
+            false,
         )
         .await
         .map(|_| ())
@@ -143,7 +190,8 @@ impl ClusterClient {
         leader_id: NodeId,
         request: ClusterMessage<LogReplicationRequest>,
     ) -> Result<LogReplicationResponse> {
-        let Some(leader_node) = self.remote_nodes.get(&leader_id) else {
+        let remotes = self.remote_nodes.load();
+        let Some(leader_node) = remotes.get(&leader_id) else {
             return Err(anyhow!(
                 "leader with id [{:?}] not found",
                 request.node_id()
@@ -154,7 +202,15 @@ impl ClusterClient {
     }
 
     pub fn exists(&self, node_id: &NodeId) -> bool {
-        self.remote_nodes.contains_key(node_id)
+        self.membership.configuration().contains(node_id)
+    }
+
+    pub fn is_voter(&self, node_id: &NodeId) -> bool {
+        self.membership.configuration().is_voter(node_id)
+    }
+
+    pub fn address_of(&self, node_id: &NodeId) -> Option<NodeAddress> {
+        self.membership.configuration().address_of(node_id).cloned()
     }
 
     async fn broadcast_call_quorum<Req: Debug, Resp: NodeAware, RemCall, SuccessPred>(
@@ -167,14 +223,28 @@ impl ClusterClient {
         RemCall: AsyncFn(&RemoteNode, &Req) -> Resp,
         SuccessPred: Fn(&Resp) -> bool,
     {
-        // remote_nodes should contain all cluster nodes excluding the current
+        let configuration = self.membership.configuration();
+        let Some(quorum) = configuration.quorum_size() else {
+            // A node that has not joined yet has no voters. Treating that as "quorum
+            // already reached" would let it win an election or commit changes alone.
+            bail!("cluster has no voters; the node has not joined yet")
+        };
+        let needed = if configuration.is_voter(&self.node_id) {
+            quorum.saturating_sub(1)
+        } else {
+            quorum
+        };
         self.broadcast_call(
             request,
             remote_call_fn,
             success_predicate,
-            |successful_requests| {
-                successful_requests * Self::QUORUM_MULTIPLIER >= self.remote_nodes.len()
+            move |succeeded| {
+                let acknowledgements = succeeded
+                    .filter(|id| configuration.is_voter(id))
+                    .count();
+                acknowledgements >= needed
             },
+            false,
         )
         .await
     }
@@ -186,40 +256,45 @@ impl ClusterClient {
         remote_call_fn: RemCall,
         success_criteria: SuccessPred,
         quorum_predicate: QuorumPred,
+        tolerate_errors: bool,
     ) -> Result<HashMap<NodeId, Resp>>
     where
         RemCall: AsyncFn(&RemoteNode, &Req) -> Resp,
         SuccessPred: Fn(&Resp) -> bool,
-        QuorumPred: Fn(usize) -> bool,
+        QuorumPred: Fn(Keys<NodeId, Resp>) -> bool,
     {
-        if self.remote_nodes.is_empty()
-            || (self.remote_nodes.len() == 1 && self.remote_nodes.contains_key(&self.node_id))
-        {
-            return Ok(Self::_empty_map());
-        }
-        // TODO ensure, remote_call_fn is launched for all elements in collection concurrently, not sequentially
-        let mut remote_calls = self
-            .remote_nodes
+        let remotes = self.remote_nodes.load_full();
+        let mut remote_calls = remotes
             .iter()
-            .filter(|(node_id, _)| &self.node_id != *node_id)
+            .filter(|(node_id, _)| **node_id != self.node_id)
             .map(|(_, remote_node)| timeout(self.max_timeout, remote_call_fn(remote_node, request)))
             .collect::<FuturesUnordered<_>>();
 
-        let expected_requests = remote_calls.len();
         let mut succeeded_requests = HashMap::with_capacity(remote_calls.len());
-        while let Some(response) = remote_calls.next().await {
-            let response = response?;
-            if success_criteria(&response) {
-                succeeded_requests.insert(response.node_id().clone(), response);
+        while let Some(result) = remote_calls.next().await {
+            match result {
+                Ok(response) => {
+                    if success_criteria(&response) {
+                        succeeded_requests.insert(response.node_id().clone(), response);
+                    }
+                }
+                Err(error) if tolerate_errors => warn!("[broadcast] remote call did not finish in time: {error}"),
+                Err(error) => return Err(anyhow!("remote call failed: {error}")),
             }
-            if quorum_predicate(succeeded_requests.len())
-                || succeeded_requests.len() == expected_requests
-            {
+            // Configuration broadcasts must reach every member, so they keep collecting
+            // responses even after a quorum has been reached (`tolerate_errors` is the
+            // "broadcast" mode here). Quorum calls return as soon as they can decide.
+            if !tolerate_errors && quorum_predicate(succeeded_requests.keys()) {
                 return Ok(succeeded_requests);
             }
         }
-        Err(anyhow!(
-            "Batch request failed. Quorum hasn't been achieved for request: {request:?}"
-        ))
+
+        if quorum_predicate(succeeded_requests.keys()) {
+            Ok(succeeded_requests)
+        } else {
+            Err(anyhow!(
+                "Batch request failed. Quorum hasn't been achieved for request: {request:?}"
+            ))
+        }
     }
 }

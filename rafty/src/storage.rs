@@ -12,6 +12,7 @@ pub trait Storage: Debug + Send + Sync {
 #[derive(Debug, Default)]
 pub struct InMemoryStorage {}
 
+#[allow(unused_variables)]
 impl Storage for InMemoryStorage {
     fn push(&self, key: Key, payload: Payload) -> Result<()> {
         todo!()
