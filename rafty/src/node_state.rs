@@ -1,4 +1,4 @@
-use crate::cluster::ClusterConfiguration;
+use crate::cluster::{ClusterConfiguration, ConfigChange};
 use crate::job::log_replication::LogReplicationJob;
 use crate::job::registry::JobRegistry;
 use crate::log::CommandLog;
@@ -7,10 +7,12 @@ use crate::remote_node::ClusterClient;
 use crate::storage::Storage;
 use crate::transport::model::command::{Command, CommandType};
 use crate::transport::model::common::{CommitRequest, HeartbeatRequest};
-use crate::transport::model::membership::{ConfigurationAck, ConfigurationBroadcast};
+use crate::transport::model::membership::{
+    ConfigurationAck, ConfigurationBroadcast, JoinRequest, JoinResponse,
+};
 use crate::transport::model::vote::{VoteRequest, VoteResponse};
 use crate::transport::model::{ClusterMessage, Key, NodeAware};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -112,6 +114,18 @@ impl Node {
         try_candidate() => Candidate(State<Candidate>),
         try_leader() => Leader(State<Leader>),
     );
+
+    /// Handles a join request in any state: the leader admits, followers redirect.
+    pub async fn handle_join(
+        &self,
+        request: ClusterMessage<JoinRequest>,
+    ) -> Result<ClusterMessage<JoinResponse>> {
+        match self {
+            Node::Follower(state) => Ok(state.handle_join(request)),
+            Node::Candidate(state) => Ok(state.handle_join(request)),
+            Node::Leader(state) => state.handle_join(request).await,
+        }
+    }
 
     pub fn apply_configuration(
         &self,
@@ -246,11 +260,7 @@ impl<S: StateOption> State<S> {
         )
     }
 
-    pub fn cluster_nodes(&self) -> &Arc<ClusterClient> {
-        &self.cluster_nodes
-    }
-
-    pub fn configuration(&self) -> Arc<ClusterConfiguration> {
+    fn configuration(&self) -> Arc<ClusterConfiguration> {
         self.cluster_nodes.configuration()
     }
 
@@ -272,11 +282,14 @@ impl<S: StateOption> State<S> {
                 ),
             )
         } else {
-            self.term
-                .fetch_max(request.metadata.term, Ordering::Relaxed);
+            self.term.fetch_max(request.metadata.term, Ordering::Relaxed);
             self.cluster_nodes.install_configuration(request)
         };
         ClusterMessage::new(self.node_id.clone(), self.term.load(Ordering::Relaxed), ack)
+    }
+
+    fn _join_response(&self, payload: JoinResponse) -> ClusterMessage<JoinResponse> {
+        self._construct_msg(payload)
     }
 }
 
@@ -289,6 +302,37 @@ impl State<Follower> {
 
     pub fn set_leader(&mut self, leader_id: NodeId) {
         self.state.leader_id = Some(leader_id);
+    }
+
+    pub fn leader_id(&self) -> Option<&NodeId> {
+        self.state.leader_id.as_ref()
+    }
+
+    /// A follower cannot admit nodes; it redirects the joiner to the leader it knows.
+    pub fn handle_join(
+        &self,
+        request: ClusterMessage<JoinRequest>,
+    ) -> ClusterMessage<JoinResponse> {
+        let payload = &request.payload;
+        if payload.cluster_id != self.configuration().cluster_id {
+            return self._join_response(JoinResponse::Rejected {
+                reason: format!(
+                    "cluster [{}] does not match local cluster [{}]",
+                    payload.cluster_id,
+                    self.configuration().cluster_id
+                ),
+            });
+        }
+        let response = self.state.leader_id.as_ref()
+            .and_then(|leader_id| {
+                self.cluster_nodes
+                    .address_of(leader_id)
+                    .map(|address| JoinResponse::Redirect { leader_id: leader_id.clone(), address })
+            })
+            .unwrap_or_else(|| JoinResponse::Rejected {
+                reason: "this node does not know a leader; retry another seed".to_owned(),
+            });
+        self._join_response(response)
     }
 
     pub async fn push(&self, command: Command) -> Result<()> {
@@ -341,6 +385,7 @@ impl State<Follower> {
         Ok(())
     }
 
+    #[allow(unused)]
     async fn replicate_log(_since: DateTime<Utc>) {
         todo!()
     }
@@ -368,6 +413,15 @@ impl State<Candidate> {
 
     pub fn into_follower(self, leader_id: NodeId) -> State<Follower> {
         self._into(Follower::new(leader_id))
+    }
+
+    pub fn handle_join(
+        &self,
+        _request: ClusterMessage<JoinRequest>,
+    ) -> ClusterMessage<JoinResponse> {
+        self._join_response(JoinResponse::Rejected {
+            reason: "election in progress; retry another seed".to_owned(),
+        })
     }
 
     pub async fn start_election(self) -> Result<State<Leader>, State<Follower>> {
@@ -421,5 +475,87 @@ impl State<Leader> {
             self.cluster_nodes.heartbeat(message),
         )
         .await?
+    }
+
+    /// Admits a node as a learner and replicates the new configuration.
+    ///
+    /// The learner starts receiving log entries immediately, but it does not vote until
+    /// [`State::<Leader>::promote_member`] is called after it has caught up.
+    pub async fn handle_join(
+        &self,
+        request: ClusterMessage<JoinRequest>,
+    ) -> Result<ClusterMessage<JoinResponse>> {
+        let payload = &request.payload;
+        let current = self.configuration();
+
+        if payload.cluster_id != current.cluster_id {
+            return Ok(self._join_response(JoinResponse::Rejected {
+                reason: format!(
+                    "cluster [{}] does not match local cluster [{}]",
+                    payload.cluster_id, current.cluster_id
+                ),
+            }));
+        }
+        if payload.node_id == self.node_id {
+            return Ok(self._join_response(JoinResponse::Rejected {
+                reason: "a node cannot join itself".to_owned(),
+            }));
+        }
+
+        if let Some(member) = current.get(&payload.node_id) {
+            if member.address != payload.address {
+                return Ok(self._join_response(JoinResponse::Rejected {
+                    reason: format!(
+                        "node [{}] is already a member at [{}]; address changes require remove + add",
+                        payload.node_id, member.address
+                    ),
+                }));
+            }
+            return Ok(self._join_response(JoinResponse::Accepted {
+                leader_id: self.node_id.clone(),
+                configuration: (*current).clone(),
+                voter: member.is_voter(),
+            }));
+        }
+
+        let next = self
+            .cluster_nodes
+            .change_configuration(
+                ConfigChange::AddLearner {
+                    node_id: payload.node_id.clone(),
+                    address: payload.address.clone(),
+                },
+                self.term(),
+            )
+            .await?;
+
+        Ok(self._join_response(JoinResponse::Accepted {
+            leader_id: self.node_id.clone(),
+            configuration: (*next).clone(),
+            voter: false,
+        }))
+    }
+
+    /// Promotes a caught-up learner to a voter.
+    pub async fn promote_member(&self, node_id: NodeId) -> Result<Arc<ClusterConfiguration>> {
+        if node_id == self.node_id {
+            bail!("the leader is already a voter");
+        }
+        if !self.configuration().is_learner(&node_id) {
+            bail!("node [{node_id}] is not a learner");
+        }
+        self.cluster_nodes
+            .change_configuration(ConfigChange::Promote { node_id }, self.term())
+            .await
+    }
+
+    /// Removes a member and replicates the new configuration.
+    pub async fn remove_member(&self, node_id: NodeId) -> Result<Arc<ClusterConfiguration>> {
+        if node_id == self.node_id {
+            bail!("the leader must step down before removing itself");
+        }
+        self.cluster_nodes
+            .change_configuration(ConfigChange::Remove { node_id }, self.term())
+            .await
     }
 }

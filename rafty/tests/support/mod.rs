@@ -15,7 +15,7 @@ use rafty::job::registry::JobRegistry;
 use rafty::log::CommandLog;
 use rafty::node_state::{NodeId, State, states::Follower};
 use rafty::remote_node::{
-    CandidateClient, ClusterClient, FollowerClient, LeaderClient, RemoteNode,
+    CandidateClient, ClusterClient, FollowerClient, JoinClient, LeaderClient, RemoteNode,
 };
 use rafty::storage::Storage;
 use rafty::transport::model::ClusterMessage;
@@ -25,7 +25,9 @@ use rafty::transport::model::common::{
     CommitRequest, CommitResponse, HeartbeatRequest, HeartbeatResponse,
 };
 use rafty::transport::model::log::{LogReplicationRequest, LogReplicationResponse};
-use rafty::transport::model::membership::{ConfigurationAck, ConfigurationBroadcast};
+use rafty::transport::model::membership::{
+    ConfigurationAck, ConfigurationBroadcast, JoinRequest, JoinResponse,
+};
 use rafty::transport::model::vote::{VoteRequest, VoteResponse};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -240,6 +242,7 @@ pub struct Counters {
     pub payloads: AtomicUsize,
     pub commits: AtomicUsize,
     pub configurations: AtomicUsize,
+    pub joins: AtomicUsize,
     terms: Mutex<Vec<u64>>,
 }
 
@@ -259,6 +262,7 @@ impl Counters {
             + self.payloads.load(Ordering::SeqCst)
             + self.commits.load(Ordering::SeqCst)
             + self.configurations.load(Ordering::SeqCst)
+            + self.joins.load(Ordering::SeqCst)
     }
 }
 
@@ -426,6 +430,40 @@ impl LeaderClient for Recorder {
             ConfigurationAck::rejected(0, "rejected by test double")
         };
         ClusterMessage::new(self.id.clone(), request.metadata.term, payload)
+    }
+}
+
+/// A transport that answers join requests with a canned response.
+#[derive(Debug)]
+pub struct JoinResponder {
+    pub id: NodeId,
+    pub response: JoinResponse,
+    pub calls: AtomicUsize,
+}
+
+impl JoinResponder {
+    pub fn new(id: &str, response: JoinResponse) -> Arc<Self> {
+        Arc::new(Self {
+            id: node_id(id),
+            response,
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl JoinClient for JoinResponder {
+    async fn join(&self, request: &ClusterMessage<Arc<JoinRequest>>) -> ClusterMessage<JoinResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        ClusterMessage::new(
+            self.id.clone(),
+            request.metadata.term,
+            self.response.clone(),
+        )
     }
 }
 
@@ -612,4 +650,19 @@ pub fn cluster_client_with_configuration(
         Arc::new(nodes),
         Duration::from_millis(40),
     ))
+}
+
+/// A remote node whose join client is driven by `responder`.
+pub fn joinable_remote(
+    id: &str,
+    counters: Arc<Counters>,
+    behavior: Behavior,
+    responder: Arc<JoinResponder>,
+) -> RemoteNode {
+    let recorder = Arc::new(Recorder {
+        id: node_id(id),
+        counters,
+        behavior,
+    });
+    RemoteNode::with_join(recorder.clone(), recorder.clone(), recorder, responder)
 }

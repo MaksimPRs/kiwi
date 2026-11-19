@@ -8,7 +8,9 @@ use crate::transport::model::common::{
     CommitRequest, CommitResponse, HeartbeatRequest, HeartbeatResponse,
 };
 use crate::transport::model::log::{LogReplicationRequest, LogReplicationResponse};
-use crate::transport::model::membership::{ConfigurationAck, ConfigurationBroadcast};
+use crate::transport::model::membership::{
+    ConfigurationAck, ConfigurationBroadcast, JoinRequest, JoinResponse,
+};
 use crate::transport::model::vote::{VoteRequest, VoteResponse};
 use crate::transport::model::{ClusterMessage, NodeAware};
 use anyhow::{Result, anyhow, bail};
@@ -70,11 +72,29 @@ pub trait LeaderClient: Debug + Send + Sync {
     }
 }
 
+/// Edge RPC used by a node that is not a member yet.
+///
+/// It is deliberately separate from [`LeaderClient`]: joining is not a Raft operation,
+/// and the seed may redirect the caller to the actual leader.
+#[async_trait]
+pub trait JoinClient: Debug + Send + Sync {
+    async fn join(&self, req: &ClusterMessage<Arc<JoinRequest>>) -> ClusterMessage<JoinResponse>;
+}
+
+/// Builds a transport for a member that was added at runtime.
+///
+/// The membership layer knows *who* the peers are and *where* they live; this factory
+/// turns an address into role-specific HTTP clients.
+pub trait RemoteNodeFactory: Debug + Send + Sync {
+    fn create(&self, member: &ClusterMember) -> Result<RemoteNode>;
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteNode {
     candidate_client: Arc<dyn CandidateClient>,
     follower_client: Arc<dyn FollowerClient>,
     leader_client: Arc<dyn LeaderClient>,
+    join_client: Arc<dyn JoinClient>,
 }
 
 impl RemoteNode {
@@ -82,16 +102,48 @@ impl RemoteNode {
     ///
     /// A peer may implement only a subset of the roles; in that case the remaining
     /// clients can be supplied by the same object (as an in-memory transport does).
+    /// Join is unsupported unless [`RemoteNode::with_join`] is used.
     pub fn new(
         candidate_client: Arc<dyn CandidateClient>,
         follower_client: Arc<dyn FollowerClient>,
         leader_client: Arc<dyn LeaderClient>,
     ) -> Self {
+        Self::with_join(
+            candidate_client,
+            follower_client,
+            leader_client,
+            Arc::new(UnsupportedJoin),
+        )
+    }
+
+    pub fn with_join(
+        candidate_client: Arc<dyn CandidateClient>,
+        follower_client: Arc<dyn FollowerClient>,
+        leader_client: Arc<dyn LeaderClient>,
+        join_client: Arc<dyn JoinClient>,
+    ) -> Self {
         Self {
             candidate_client,
             follower_client,
             leader_client,
+            join_client,
         }
+    }
+}
+
+#[derive(Debug)]
+struct UnsupportedJoin;
+
+#[async_trait]
+impl JoinClient for UnsupportedJoin {
+    async fn join(&self, req: &ClusterMessage<Arc<JoinRequest>>) -> ClusterMessage<JoinResponse> {
+        ClusterMessage::new(
+            req.node_id().clone(),
+            req.metadata.term,
+            JoinResponse::Rejected {
+                reason: "join is not supported by this transport".to_owned(),
+            },
+        )
     }
 }
 
@@ -109,6 +161,7 @@ pub struct ClusterClient {
     node_id: NodeId,
     membership: Arc<ClusterMembership>,
     remote_nodes: ArcSwap<HashMap<NodeId, RemoteNode>>,
+    factory: Option<Arc<dyn RemoteNodeFactory>>,
     max_timeout: Duration,
     /// Raft allows a single uncommitted configuration change at a time.
     config_change_in_flight: AtomicBool,
@@ -155,9 +208,23 @@ impl ClusterClient {
             node_id,
             membership,
             remote_nodes: ArcSwap::from(remote_nodes),
+            factory: None,
             max_timeout,
             config_change_in_flight: AtomicBool::new(false),
         }
+    }
+
+    pub fn with_factory(mut self, factory: Arc<dyn RemoteNodeFactory>) -> Self {
+        self.factory = Some(factory);
+        self
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+
+    pub fn membership(&self) -> &Arc<ClusterMembership> {
+        &self.membership
     }
 
     pub fn configuration(&self) -> Arc<ClusterConfiguration> {
@@ -250,6 +317,23 @@ impl ClusterClient {
 
     pub fn address_of(&self, node_id: &NodeId) -> Option<NodeAddress> {
         self.membership.configuration().address_of(node_id).cloned()
+    }
+
+    /// Sends a join request to a seed.
+    pub async fn join(
+        &self,
+        seed: &NodeId,
+        request: ClusterMessage<Arc<JoinRequest>>,
+    ) -> Result<ClusterMessage<JoinResponse>> {
+        let remote = self
+            .remote_nodes
+            .load()
+            .get(seed)
+            .cloned()
+            .ok_or_else(|| anyhow!("seed node [{seed}] is not known to this node"))?;
+        timeout(self.max_timeout, remote.join_client.join(&request))
+            .await
+            .map_err(|_| anyhow!("join request to [{seed}] timed out"))
     }
 
     /// Installs the authoritative configuration returned by the leader.
@@ -374,6 +458,8 @@ impl ClusterClient {
         )
         .await?;
 
+        self.deliver_to_new_members(&message, &current, &next).await;
+
         self.membership.record_committed(entry)?;
         self.membership.install_snapshot(next.clone())?;
         self.reconcile_remotes(&next);
@@ -388,10 +474,71 @@ impl ClusterClient {
         Ok(ConfigChangeGuard(&self.config_change_in_flight))
     }
 
+    /// Best-effort delivery to members that were not part of the old configuration
+    /// (typically the learner that just joined).
+    async fn deliver_to_new_members(
+        &self,
+        message: &ClusterMessage<ConfigurationBroadcast>,
+        current: &ClusterConfiguration,
+        next: &ClusterConfiguration,
+    ) {
+        for member in next
+            .members()
+            .filter(|member| !current.contains(&member.id) && member.id != self.node_id)
+        {
+            let Some(remote) = self.remote_for(member) else {
+                continue;
+            };
+            let _ = timeout(
+                self.max_timeout,
+                remote.leader_client.install_configuration(message),
+            )
+            .await;
+        }
+    }
+
+    fn remote_for(&self, member: &ClusterMember) -> Option<RemoteNode> {
+        if let Some(remote) = self.remote_nodes.load().get(&member.id).cloned() {
+            return Some(remote);
+        }
+        let factory = self.factory.as_ref()?;
+        match factory.create(member) {
+            Ok(remote) => {
+                self.register_remote(member.id.clone(), remote.clone());
+                Some(remote)
+            }
+            Err(error) => {
+                warn!(
+                    "[membership] unable to build a transport for [{}] at [{}]: {error:#}",
+                    member.id, member.address
+                );
+                None
+            }
+        }
+    }
+
     fn reconcile_remotes(&self, configuration: &ClusterConfiguration) {
         let current = self.remote_nodes.load_full();
         let mut next = (*current).clone();
         next.retain(|id, _| configuration.contains(id));
+        let missing: Vec<ClusterMember> = configuration
+            .members()
+            .filter(|member| member.id != self.node_id && !next.contains_key(&member.id))
+            .cloned()
+            .collect();
+        for member in missing {
+            if let Some(factory) = &self.factory {
+                match factory.create(&member) {
+                    Ok(remote) => {
+                        next.insert(member.id.clone(), remote);
+                    }
+                    Err(error) => warn!(
+                        "[membership] unable to build a transport for [{}] at [{}]: {error:#}",
+                        member.id, member.address
+                    ),
+                }
+            }
+        }
         self.remote_nodes.store(Arc::new(next));
     }
 

@@ -15,7 +15,8 @@ use crate::cluster::{
     ClusterConfiguration, ClusterId, ClusterMember, ClusterMembership, NodeAddress,
 };
 use crate::node_state::NodeId;
-use crate::remote_node::{ClusterClient, RemoteNode};
+use crate::remote_node::{ClusterClient, RemoteNode, RemoteNodeFactory};
+use crate::transport::model::membership::JoinRequest;
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -144,22 +145,38 @@ impl Config {
 
     /// Builds the node's [`ClusterClient`] from this static configuration.
     ///
-    /// `remote_nodes` must contain a transport for every peer this node can dial.
+    /// `remote_nodes` must contain a transport for every peer this node can dial
+    /// (the seeds, for a joining node). When `factory` is supplied, transports for
+    /// members added at runtime are built on demand.
     pub fn cluster_client(
         &self,
         remote_nodes: HashMap<NodeId, RemoteNode>,
+        factory: Option<Arc<dyn RemoteNodeFactory>>,
     ) -> Result<Arc<ClusterClient>> {
-        Ok(Arc::new(ClusterClient::with_membership(
+        let mut client = ClusterClient::with_membership(
             self.node_id.clone(),
             self.initial_membership()?,
             Arc::new(remote_nodes),
             self.request_timeout,
-        )))
+        );
+        if let Some(factory) = factory {
+            client = client.with_factory(factory);
+        }
+        Ok(Arc::new(client))
     }
 
     /// Seed identities, ready to hand to [`crate::job::join::JoinJob`].
     pub fn seed_ids(&self) -> Vec<NodeId> {
         self.seeds().into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// The join request this node sends to a seed at startup.
+    pub fn join_request(&self) -> JoinRequest {
+        JoinRequest::new(
+            self.cluster_id.clone(),
+            self.node_id.clone(),
+            self.advertise.clone(),
+        )
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -293,7 +310,7 @@ mod tests {
         assert_eq!(config.seed_ids().len(), 3);
         assert_eq!(config.initial_configuration().unwrap().voter_count(), 0);
 
-        let client = config.cluster_client(HashMap::new()).unwrap();
+        let client = config.cluster_client(HashMap::new(), None).unwrap();
         assert_eq!(client.configuration().index, 0);
         assert_eq!(client.configuration().voter_count(), 0);
     }
@@ -301,7 +318,7 @@ mod tests {
     #[test]
     fn bootstrap_configuration_builds_a_client_with_all_voters() {
         let config = Config::from_yaml(REFERENCE).unwrap();
-        let client = config.cluster_client(HashMap::new()).unwrap();
+        let client = config.cluster_client(HashMap::new(), None).unwrap();
 
         assert_eq!(client.configuration().voter_count(), 3);
         assert_eq!(client.configuration().quorum_size(), Some(2));
@@ -383,6 +400,7 @@ config:
         assert!(!config.bootstrap);
         assert_eq!(config.seeds().len(), 2);
         assert_eq!(config.seed_ids().len(), 2);
+        assert_eq!(config.join_request().node_id, NodeId::new("node4"));
         assert_eq!(
             config.initial_configuration().unwrap().voter_count(),
             0,

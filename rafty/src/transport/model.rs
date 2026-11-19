@@ -169,13 +169,55 @@ pub mod vote {
     }
 }
 
-/// Messages used to replicate the cluster configuration.
+/// Messages used to discover the cluster and to replicate its configuration.
 ///
-/// A [`ConfigurationBroadcast`] is a *Raft* operation: a committed configuration entry
-/// is replicated to every member.
+/// The distinction matters: a [`JoinRequest`] is an *edge* operation (a node that is
+/// not a member yet asks an existing one for admission), while a
+/// [`ConfigurationBroadcast`] is a *Raft* operation (a committed configuration entry is
+/// replicated to every member).
 pub mod membership {
-    use crate::cluster::{ClusterConfiguration, ConfigurationEntry};
+    use crate::cluster::{ClusterConfiguration, ClusterId, ConfigurationEntry, NodeAddress};
+    use crate::node_state::NodeId;
     use serde::{Deserialize, Serialize};
+
+    /// Sent by a node that wants to become a member.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct JoinRequest {
+        /// Must match the receiver's cluster, otherwise the node is rejected.
+        pub cluster_id: ClusterId,
+        pub node_id: NodeId,
+        /// Address the joining node advertises to the rest of the cluster.
+        pub address: NodeAddress,
+    }
+
+    impl JoinRequest {
+        pub fn new(cluster_id: ClusterId, node_id: NodeId, address: NodeAddress) -> Self {
+            Self {
+                cluster_id,
+                node_id,
+                address,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum JoinResponse {
+        /// The leader admitted the node as a learner (or it was already a member).
+        Accepted {
+            leader_id: NodeId,
+            configuration: ClusterConfiguration,
+            /// `false` while the node is still catching up as a learner.
+            voter: bool,
+        },
+        /// This node is not the leader and points at the one that is.
+        Redirect {
+            leader_id: NodeId,
+            address: NodeAddress,
+        },
+        Rejected {
+            reason: String,
+        },
+    }
 
     /// A committed configuration entry plus the full configuration it produces.
     ///
