@@ -168,3 +168,47 @@ pub mod vote {
         pub voted: bool,
     }
 }
+
+/// Messages used to replicate the cluster configuration.
+///
+/// A [`ConfigurationBroadcast`] is a *Raft* operation: a committed configuration entry
+/// is replicated to every member.
+pub mod membership {
+    use crate::cluster::{ClusterConfiguration, ConfigurationEntry};
+    use serde::{Deserialize, Serialize};
+
+    /// A committed configuration entry plus the full configuration it produces.
+    ///
+    /// Followers validate the entry against their current configuration and then
+    /// install the snapshot, which makes the update idempotent under retries.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ConfigurationBroadcast {
+        pub entry: ConfigurationEntry,
+        pub configuration: ClusterConfiguration,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ConfigurationAck {
+        pub accepted: bool,
+        pub applied_index: u64,
+        pub reason: Option<String>,
+    }
+
+    impl ConfigurationAck {
+        pub fn accepted(applied_index: u64) -> Self {
+            Self {
+                accepted: true,
+                applied_index,
+                reason: None,
+            }
+        }
+
+        pub fn rejected(applied_index: u64, reason: impl Into<String>) -> Self {
+            Self {
+                accepted: false,
+                applied_index,
+                reason: Some(reason.into()),
+            }
+        }
+    }
+}

@@ -1,3 +1,4 @@
+use crate::cluster::ClusterConfiguration;
 use crate::job::log_replication::LogReplicationJob;
 use crate::job::registry::JobRegistry;
 use crate::log::CommandLog;
@@ -6,6 +7,7 @@ use crate::remote_node::ClusterClient;
 use crate::storage::Storage;
 use crate::transport::model::command::{Command, CommandType};
 use crate::transport::model::common::{CommitRequest, HeartbeatRequest};
+use crate::transport::model::membership::{ConfigurationAck, ConfigurationBroadcast};
 use crate::transport::model::vote::{VoteRequest, VoteResponse};
 use crate::transport::model::{ClusterMessage, Key, NodeAware};
 use anyhow::{Result, anyhow};
@@ -110,6 +112,17 @@ impl Node {
         try_candidate() => Candidate(State<Candidate>),
         try_leader() => Leader(State<Leader>),
     );
+
+    pub fn apply_configuration(
+        &self,
+        request: &ClusterMessage<ConfigurationBroadcast>,
+    ) -> ClusterMessage<ConfigurationAck> {
+        match self {
+            Node::Follower(state) => state.apply_configuration(request),
+            Node::Candidate(state) => state.apply_configuration(request),
+            Node::Leader(state) => state.apply_configuration(request),
+        }
+    }
 }
 
 #[allow(private_bounds)]
@@ -231,6 +244,39 @@ impl<S: StateOption> State<S> {
             self.term.load(Ordering::Relaxed),
             payload,
         )
+    }
+
+    pub fn cluster_nodes(&self) -> &Arc<ClusterClient> {
+        &self.cluster_nodes
+    }
+
+    pub fn configuration(&self) -> Arc<ClusterConfiguration> {
+        self.cluster_nodes.configuration()
+    }
+
+    /// Applies a configuration entry received from the leader.
+    ///
+    /// Stale-term messages are rejected; the configuration itself is applied atomically
+    /// and is idempotent under retries (see [`ClusterClient::install_configuration`]).
+    pub fn apply_configuration(
+        &self,
+        request: &ClusterMessage<ConfigurationBroadcast>,
+    ) -> ClusterMessage<ConfigurationAck> {
+        let current_term = self.term.load(Ordering::Relaxed);
+        let ack = if request.metadata.term < current_term {
+            ConfigurationAck::rejected(
+                self.configuration().index,
+                format!(
+                    "stale term: message term {} < local term {current_term}",
+                    request.metadata.term
+                ),
+            )
+        } else {
+            self.term
+                .fetch_max(request.metadata.term, Ordering::Relaxed);
+            self.cluster_nodes.install_configuration(request)
+        };
+        ClusterMessage::new(self.node_id.clone(), self.term.load(Ordering::Relaxed), ack)
     }
 }
 

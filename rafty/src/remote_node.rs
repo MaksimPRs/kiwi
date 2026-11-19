@@ -1,5 +1,6 @@
 use crate::cluster::{
-    ClusterConfiguration, ClusterId, ClusterMember, ClusterMembership, NodeAddress,
+    ClusterConfiguration, ClusterId, ClusterMember, ClusterMembership, ConfigChange,
+    ConfigurationEntry, NodeAddress,
 };
 use crate::node_state::NodeId;
 use crate::transport::model::command::Command;
@@ -7,6 +8,7 @@ use crate::transport::model::common::{
     CommitRequest, CommitResponse, HeartbeatRequest, HeartbeatResponse,
 };
 use crate::transport::model::log::{LogReplicationRequest, LogReplicationResponse};
+use crate::transport::model::membership::{ConfigurationAck, ConfigurationBroadcast};
 use crate::transport::model::vote::{VoteRequest, VoteResponse};
 use crate::transport::model::{ClusterMessage, NodeAware};
 use anyhow::{Result, anyhow, bail};
@@ -19,6 +21,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Keys;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -46,6 +49,25 @@ pub trait LeaderClient: Debug + Send + Sync {
         &self,
         req: &ClusterMessage<HeartbeatRequest>,
     ) -> ClusterMessage<HeartbeatResponse>;
+
+    /// Replicates a committed configuration entry.
+    ///
+    /// The default keeps existing transports source-compatible; a transport that wants
+    /// to participate in membership changes must override it, otherwise the leader can
+    /// never form a quorum for a configuration change.
+    async fn install_configuration(
+        &self,
+        req: &ClusterMessage<ConfigurationBroadcast>,
+    ) -> ClusterMessage<ConfigurationAck> {
+        ClusterMessage::new(
+            req.node_id().clone(),
+            req.metadata.term,
+            ConfigurationAck::rejected(
+                0,
+                "configuration replication is not supported by this transport",
+            ),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -74,11 +96,22 @@ impl RemoteNode {
 }
 
 #[derive(Debug)]
+struct ConfigChangeGuard<'a>(&'a AtomicBool);
+
+impl Drop for ConfigChangeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug)]
 pub struct ClusterClient {
     node_id: NodeId,
     membership: Arc<ClusterMembership>,
     remote_nodes: ArcSwap<HashMap<NodeId, RemoteNode>>,
     max_timeout: Duration,
+    /// Raft allows a single uncommitted configuration change at a time.
+    config_change_in_flight: AtomicBool,
 }
 
 fn accept_all<T>(_response: &T) -> bool {
@@ -123,11 +156,17 @@ impl ClusterClient {
             membership,
             remote_nodes: ArcSwap::from(remote_nodes),
             max_timeout,
+            config_change_in_flight: AtomicBool::new(false),
         }
     }
 
     pub fn configuration(&self) -> Arc<ClusterConfiguration> {
         self.membership.configuration()
+    }
+
+    /// Committed configuration entries, oldest first.
+    pub fn configuration_history(&self) -> Result<Vec<ConfigurationEntry>> {
+        self.membership.entries()
     }
 
     pub fn register_remote(&self, node_id: NodeId, remote: RemoteNode) {
@@ -211,6 +250,149 @@ impl ClusterClient {
 
     pub fn address_of(&self, node_id: &NodeId) -> Option<NodeAddress> {
         self.membership.configuration().address_of(node_id).cloned()
+    }
+
+    /// Installs the authoritative configuration returned by the leader.
+    pub fn install_snapshot(&self, configuration: ClusterConfiguration) -> Result<()> {
+        self.membership.install_snapshot(configuration.clone())?;
+        self.reconcile_remotes(&configuration);
+        Ok(())
+    }
+
+    /// Applies a replicated configuration entry.
+    pub fn install_configuration(
+        &self,
+        message: &ClusterMessage<ConfigurationBroadcast>,
+    ) -> ConfigurationAck {
+        let broadcast = &message.payload;
+        let current = self.membership.configuration();
+
+        if broadcast.entry.term != message.metadata.term {
+            return ConfigurationAck::rejected(
+                current.index,
+                format!(
+                    "entry term {} does not match message term {}",
+                    broadcast.entry.term, message.metadata.term
+                ),
+            );
+        }
+        if broadcast.configuration.cluster_id != current.cluster_id {
+            return ConfigurationAck::rejected(
+                current.index,
+                format!(
+                    "configuration belongs to cluster [{}], local cluster is [{}]",
+                    broadcast.configuration.cluster_id, current.cluster_id
+                ),
+            );
+        }
+
+        if broadcast.entry.index <= current.index {
+            return ConfigurationAck::accepted(current.index);
+        }
+        if broadcast.entry.index != current.index + 1 {
+            return ConfigurationAck::rejected(
+                current.index,
+                format!(
+                    "configuration entry gap: got index {}, expected {}",
+                    broadcast.entry.index,
+                    current.index + 1
+                ),
+            );
+        }
+
+        let expected = match current.applied(&broadcast.entry.change) {
+            Ok(expected) => expected,
+            Err(error) => {
+                return ConfigurationAck::rejected(current.index, error.to_string());
+            }
+        };
+        if expected != broadcast.configuration {
+            return ConfigurationAck::rejected(
+                current.index,
+                "broadcast configuration does not match its entry",
+            );
+        }
+
+        if let Err(error) = self.membership.record_committed(broadcast.entry.clone()) {
+            return ConfigurationAck::rejected(current.index, error.to_string());
+        }
+        if let Err(error) = self
+            .membership
+            .install_snapshot(broadcast.configuration.clone())
+        {
+            return ConfigurationAck::rejected(current.index, error.to_string());
+        }
+        self.reconcile_remotes(&broadcast.configuration);
+        ConfigurationAck::accepted(broadcast.configuration.index)
+    }
+
+    /// Proposes, replicates and applies a membership change as leader.
+    ///
+    /// Only one change may be in flight. The new configuration is installed locally
+    /// only after a quorum of the *current* voters acknowledged it.
+    pub async fn change_configuration(
+        &self,
+        change: ConfigChange,
+        term: u64,
+    ) -> Result<Arc<ClusterConfiguration>> {
+        let guard = self.begin_config_change()?;
+
+        let current = self.membership.configuration();
+        let next = current.applied(&change)?;
+        let entry = ConfigurationEntry::new(next.index, term, change);
+        let message = ClusterMessage::new(
+            self.node_id.clone(),
+            term,
+            ConfigurationBroadcast {
+                entry: entry.clone(),
+                configuration: next.clone(),
+            },
+        );
+
+        let quorum_configuration = Arc::clone(&current);
+        let Some(quorum) = current.quorum_size() else {
+            bail!("cannot change the configuration of a cluster without voters");
+        };
+        let needed = if current.is_voter(&self.node_id) {
+            quorum.saturating_sub(1)
+        } else {
+            quorum
+        };
+
+        self.broadcast_call(
+            &message,
+            async |node, request| node.leader_client.install_configuration(request).await,
+            |ack| ack.accepted,
+            move |succeeded| {
+                succeeded
+                    .filter(|id| quorum_configuration.is_voter(id))
+                    .count()
+                    >= needed
+            },
+            // A single unreachable follower must not defeat an otherwise formed quorum.
+            true,
+        )
+        .await?;
+
+        self.membership.record_committed(entry)?;
+        self.membership.install_snapshot(next.clone())?;
+        self.reconcile_remotes(&next);
+        drop(guard);
+        Ok(Arc::new(next))
+    }
+
+    fn begin_config_change(&self) -> Result<ConfigChangeGuard<'_>> {
+        self.config_change_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| anyhow!("another configuration change is already in progress"))?;
+        Ok(ConfigChangeGuard(&self.config_change_in_flight))
+    }
+
+    fn reconcile_remotes(&self, configuration: &ClusterConfiguration) {
+        let current = self.remote_nodes.load_full();
+        let mut next = (*current).clone();
+        next.retain(|id, _| configuration.contains(id));
+        self.remote_nodes.store(Arc::new(next));
     }
 
     async fn broadcast_call_quorum<Req: Debug, Resp: NodeAware, RemCall, SuccessPred>(
