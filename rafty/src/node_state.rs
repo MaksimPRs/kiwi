@@ -98,6 +98,7 @@ impl Node {
         }
     }
 
+    // FIXME, return reference instead of cloned instance
     impl_try_from_node!(
         try_follower(leader_id: Option<NodeId>) => Follower(State<Follower>),
         try_candidate() => Candidate(State<Candidate>),

@@ -1,0 +1,74 @@
+name: Marker tasks
+
+# Files GitHub Projects tasks from TODO/FIXME comments and [WIP] headings.
+# Deterministic: this workflow does not call DeepSeek.
+#
+# Required repository configuration (shared with the DeepSeek triage workflow):
+#   secrets.PROJECT_TOKEN  - PAT with the `project` scope (+ `repo` for --as-issues)
+#   vars.PROJECT_OWNER, vars.PROJECT_NUMBER
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report what would be created, without writing anything
+        type: boolean
+        default: true
+      as_issues:
+        description: Open repository issues instead of project draft tasks
+        type: boolean
+        default: false
+      kinds:
+        description: "Marker kinds: comment,wip or specific todo,fixme,xxx,hack"
+        type: string
+        default: "comment,wip"
+      limit:
+        description: Maximum number of tasks to create in this run
+        type: number
+        default: 50
+      project:
+        description: Optional OWNER/NUMBER override for this run
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  issues: read
+
+concurrency:
+  group: marker-triage
+  cancel-in-progress: false
+
+env:
+  PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+  PROJECT_REF: ${{ inputs.project || format('{0}/{1}', vars.PROJECT_OWNER, vars.PROJECT_NUMBER) }}
+
+jobs:
+  scan:
+    name: Extract markers into project tasks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # Pure read: shows exactly what the scanner sees, in the job log.
+      - name: List markers
+        run: python3 scripts/scan_markers.py --list --kinds "${{ inputs.kinds }}"
+
+      - name: Verify project access
+        run: python3 scripts/scan_markers.py --project "$PROJECT_REF" --check
+
+      - name: Create tasks
+        run: |
+          python3 scripts/scan_markers.py \
+            --project "$PROJECT_REF" \
+            --kinds "${{ inputs.kinds }}" \
+            --limit "${{ inputs.limit }}" \
+            ${{ inputs.as_issues && '--as-issues' || '' }} \
+            ${{ inputs.dry_run && '--dry-run' || '' }}

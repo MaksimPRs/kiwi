@@ -445,7 +445,7 @@ use rafty::storage::Storage;
 use rafty::transport::model::Key;
 use rafty::transport::model::command::{Command, Payload};
 
-// Narrow first, then call the operation. `try_leader` returns a clone (FIXME, return reference instead) of
+// Narrow first, then call the operation. `try_leader` returns a clone of
 // State<Leader>, so no ArcSwap guard is held across the await.
 let leader = node.load().try_leader()?;
 let key = Key::new("greeting");
