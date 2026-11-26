@@ -1,0 +1,74 @@
+name: DeepSeek issue triage
+
+# Manual only: nothing runs until you press "Run workflow".
+#
+# Required repository configuration (see .github/DEEPSEEK_AGENT.md):
+#   secrets.DEEPSEEK_API_KEY  - DeepSeek API key
+#   secrets.PROJECT_TOKEN     - PAT with the `project` scope; the default
+#                               GITHUB_TOKEN cannot access Projects V2 at all
+#   vars.PROJECT_OWNER        - owner of the project board
+#   vars.PROJECT_NUMBER       - number of the project board
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report the tasks that would be created, without writing anything
+        type: boolean
+        default: true
+      mode:
+        description: "board-items = add the issue to the board, draft-tasks = file generated tasks"
+        type: choice
+        options: [board-items, draft-tasks]
+        default: board-items
+      max_issues:
+        description: Maximum number of open issues to triage in this run
+        type: number
+        default: 25
+      project:
+        description: Optional OWNER/NUMBER override for this run
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  issues: read
+
+# Never let two triage runs race on the same board.
+concurrency:
+  group: deepseek-triage
+  cancel-in-progress: false
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+  DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+  DEEPSEEK_MODEL: ${{ vars.DEEPSEEK_MODEL || 'deepseek-chat' }}
+  PROJECT_REF: ${{ inputs.project || format('{0}/{1}', vars.PROJECT_OWNER, vars.PROJECT_NUMBER) }}
+
+jobs:
+  triage:
+    name: Triage open issues into project tasks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # Fails fast with a readable message if the project, its fields, or the
+      # PAT scopes are wrong, before any issues are sent to DeepSeek.
+      - name: Verify project access
+        run: python3 scripts/deepseek_triage.py --project "$PROJECT_REF" --check
+
+      - name: Triage issues
+        run: |
+          python3 scripts/deepseek_triage.py \
+            --project "$PROJECT_REF" \
+            --mode "${{ inputs.mode }}" \
+            --limit "${{ inputs.max_issues }}" \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
