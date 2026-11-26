@@ -15,8 +15,8 @@ const AVAILABLE_JOBS_COUNT: usize = 3;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum JobKey {
-    HeartbeatPush,
-    HeartbeatCountdown,
+    HeartbeatPooling,
+    ElectionCountdown,
     LogReplication,
 }
 

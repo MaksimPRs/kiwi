@@ -50,7 +50,7 @@ async fn countdown_does_not_fire_before_the_period() {
     assert_eq!(peer.votes.load(Ordering::SeqCst), 0);
     assert!(node.load().try_leader().is_err());
 
-    registry.stop(JobKey::HeartbeatCountdown).await;
+    registry.stop(JobKey::ElectionCountdown).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -70,7 +70,7 @@ async fn countdown_starts_an_election_after_the_period() {
         "a successful election must replace the follower state"
     );
     assert!(
-        !registry.is_running(JobKey::HeartbeatCountdown),
+        !registry.is_running(JobKey::ElectionCountdown),
         "a leader stops the countdown"
     );
 }
@@ -99,7 +99,7 @@ async fn countdown_honours_the_timeout_range() {
     assert_eq!(peer.votes.load(Ordering::SeqCst), 1);
     assert!(node.load().try_leader().is_ok());
 
-    registry.stop(JobKey::HeartbeatCountdown).await;
+    registry.stop(JobKey::ElectionCountdown).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -111,7 +111,7 @@ async fn reset_postpones_the_election() {
     settle().await;
 
     tokio::time::advance(Duration::from_millis(100)).await;
-    registry.reset(JobKey::HeartbeatCountdown);
+    registry.reset(JobKey::ElectionCountdown);
     settle().await;
     tokio::time::advance(Duration::from_millis(100)).await;
     settle().await;
@@ -136,16 +136,16 @@ async fn repeated_resets_are_coalesced() {
     start_countdown(&registry, node.clone());
     settle().await;
 
-    registry.reset(JobKey::HeartbeatCountdown);
-    registry.reset(JobKey::HeartbeatCountdown);
-    registry.reset(JobKey::HeartbeatCountdown);
+    registry.reset(JobKey::ElectionCountdown);
+    registry.reset(JobKey::ElectionCountdown);
+    registry.reset(JobKey::ElectionCountdown);
     settle().await;
     tokio::time::advance(PERIOD - Duration::from_millis(1)).await;
     settle().await;
 
     assert_eq!(peer.votes.load(Ordering::SeqCst), 0);
 
-    registry.stop(JobKey::HeartbeatCountdown).await;
+    registry.stop(JobKey::ElectionCountdown).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -156,7 +156,7 @@ async fn stop_prevents_the_election() {
     start_countdown(&registry, node.clone());
     settle().await;
 
-    registry.stop(JobKey::HeartbeatCountdown).await;
+    registry.stop(JobKey::ElectionCountdown).await;
     settle().await;
     tokio::time::advance(PERIOD * 3).await;
     settle().await;
@@ -182,7 +182,7 @@ async fn countdown_does_not_elect_while_already_leader() {
     assert_eq!(peer.votes.load(Ordering::SeqCst), 0);
     assert!(node.load().try_leader().is_ok());
 
-    registry.stop(JobKey::HeartbeatCountdown).await;
+    registry.stop(JobKey::ElectionCountdown).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -212,7 +212,7 @@ async fn failed_election_is_retried() {
         "the watchdog must try again"
     );
 
-    registry.stop(JobKey::HeartbeatCountdown).await;
+    registry.stop(JobKey::ElectionCountdown).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -238,7 +238,7 @@ async fn heartbeat_polling_sends_on_every_tick() {
         assert_eq!(peer.heartbeats.load(Ordering::SeqCst), tick);
     }
 
-    registry.stop(JobKey::HeartbeatPush).await;
+    registry.stop(JobKey::HeartbeatPooling).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -268,11 +268,11 @@ async fn heartbeat_polling_keeps_running_without_configured_peers() {
     settle().await;
 
     assert!(
-        registry.is_running(JobKey::HeartbeatPush),
+        registry.is_running(JobKey::HeartbeatPooling),
         "a no-op heartbeat must not terminate polling"
     );
 
-    registry.stop(JobKey::HeartbeatPush).await;
+    registry.stop(JobKey::HeartbeatPooling).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -305,9 +305,9 @@ async fn heartbeat_polling_accepts_a_self_only_peer_set() {
     tokio::time::advance(HEARTBEAT_PERIOD * 3).await;
     settle().await;
 
-    assert!(registry.is_running(JobKey::HeartbeatPush));
+    assert!(registry.is_running(JobKey::HeartbeatPooling));
 
-    registry.stop(JobKey::HeartbeatPush).await;
+    registry.stop(JobKey::HeartbeatPooling).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -341,7 +341,7 @@ async fn heartbeat_polling_survives_an_unreachable_peer() {
     settle().await;
 
     assert!(
-        registry.is_running(JobKey::HeartbeatPush),
+        registry.is_running(JobKey::HeartbeatPooling),
         "a timed-out heartbeat must not terminate polling"
     );
     assert!(
@@ -349,7 +349,7 @@ async fn heartbeat_polling_survives_an_unreachable_peer() {
         "every polling attempt still reaches the transport"
     );
 
-    registry.stop(JobKey::HeartbeatPush).await;
+    registry.stop(JobKey::HeartbeatPooling).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -364,7 +364,7 @@ async fn aborting_heartbeat_polling_stops_the_ticks() {
     registry.register_and_start(Arc::new(HeartbeatPollingJob::new(HEARTBEAT_PERIOD, leader)));
     settle().await;
 
-    registry.stop(JobKey::HeartbeatPush).await;
+    registry.stop(JobKey::HeartbeatPooling).await;
     settle().await;
     let after_abort = peer.heartbeats.load(Ordering::SeqCst);
 

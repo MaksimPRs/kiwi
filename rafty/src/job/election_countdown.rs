@@ -46,7 +46,7 @@ impl Job for ElectionCountdownJob {
     }
 
     fn key(&self) -> JobKey {
-        JobKey::HeartbeatCountdown
+        JobKey::ElectionCountdown
     }
 
     fn trigger(&self) -> Trigger {

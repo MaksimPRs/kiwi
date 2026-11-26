@@ -26,7 +26,7 @@ impl Job for HeartbeatPollingJob {
     }
 
     fn key(&self) -> JobKey {
-        JobKey::HeartbeatPush
+        JobKey::HeartbeatPooling
     }
 
     fn trigger(&self) -> Trigger {

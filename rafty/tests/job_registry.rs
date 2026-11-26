@@ -81,15 +81,15 @@ async fn settle() {
 #[tokio::test]
 async fn start_runs_the_job_exactly_once() {
     let registry = JobRegistry::from_current();
-    let (job, starts, _) = SpyJob::new(JobKey::HeartbeatPush, Trigger::Once);
+    let (job, starts, _) = SpyJob::new(JobKey::HeartbeatPooling, Trigger::Once);
     registry.register(Arc::new(job));
 
-    registry.start(JobKey::HeartbeatPush);
+    registry.start(JobKey::HeartbeatPooling);
     settle().await;
 
     assert_eq!(starts.load(Ordering::SeqCst), 1);
     assert!(
-        !registry.is_running(JobKey::HeartbeatPush),
+        !registry.is_running(JobKey::HeartbeatPooling),
         "a Once job finishes after one tick"
     );
 }
@@ -97,7 +97,7 @@ async fn start_runs_the_job_exactly_once() {
 #[tokio::test]
 async fn register_and_start_is_a_single_call() {
     let registry = JobRegistry::from_current();
-    let (job, starts, _) = SpyJob::new(JobKey::HeartbeatPush, Trigger::Once);
+    let (job, starts, _) = SpyJob::new(JobKey::HeartbeatPooling, Trigger::Once);
 
     registry.register_and_start(Arc::new(job));
     settle().await;
@@ -108,12 +108,12 @@ async fn register_and_start_is_a_single_call() {
 #[tokio::test]
 async fn starting_a_running_job_is_ignored() {
     let registry = JobRegistry::from_current();
-    let (job, starts, _) = SpyJob::looping(JobKey::HeartbeatPush, Trigger::Once);
+    let (job, starts, _) = SpyJob::looping(JobKey::HeartbeatPooling, Trigger::Once);
     registry.register(Arc::new(job));
 
-    registry.start(JobKey::HeartbeatPush);
+    registry.start(JobKey::HeartbeatPooling);
     settle().await;
-    registry.start(JobKey::HeartbeatPush);
+    registry.start(JobKey::HeartbeatPooling);
     settle().await;
 
     assert_eq!(
@@ -121,23 +121,23 @@ async fn starting_a_running_job_is_ignored() {
         1,
         "a running job must not be started twice"
     );
-    assert!(registry.is_running(JobKey::HeartbeatPush));
+    assert!(registry.is_running(JobKey::HeartbeatPooling));
 
-    registry.stop(JobKey::HeartbeatPush).await;
+    registry.stop(JobKey::HeartbeatPooling).await;
 }
 
 #[tokio::test]
 async fn a_finished_job_can_be_started_again() {
     let registry = JobRegistry::from_current();
-    let (job, starts, _) = SpyJob::new(JobKey::HeartbeatPush, Trigger::Once);
+    let (job, starts, _) = SpyJob::new(JobKey::HeartbeatPooling, Trigger::Once);
     registry.register(Arc::new(job));
 
-    registry.start(JobKey::HeartbeatPush);
+    registry.start(JobKey::HeartbeatPooling);
     settle().await;
     assert_eq!(starts.load(Ordering::SeqCst), 1);
-    assert!(!registry.is_running(JobKey::HeartbeatPush));
+    assert!(!registry.is_running(JobKey::HeartbeatPooling));
 
-    registry.start(JobKey::HeartbeatPush);
+    registry.start(JobKey::HeartbeatPooling);
     settle().await;
 
     assert_eq!(starts.load(Ordering::SeqCst), 2);
@@ -146,7 +146,7 @@ async fn a_finished_job_can_be_started_again() {
 #[tokio::test(start_paused = true)]
 async fn every_trigger_ticks_repeatedly() {
     let registry = JobRegistry::from_current();
-    let (job, starts, _) = SpyJob::new(JobKey::HeartbeatPush, Trigger::Every(PERIOD));
+    let (job, starts, _) = SpyJob::new(JobKey::HeartbeatPooling, Trigger::Every(PERIOD));
     registry.register_and_start(Arc::new(job));
     settle().await;
 
@@ -162,14 +162,14 @@ async fn every_trigger_ticks_repeatedly() {
         assert_eq!(starts.load(Ordering::SeqCst), tick);
     }
 
-    registry.stop(JobKey::HeartbeatPush).await;
+    registry.stop(JobKey::HeartbeatPooling).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn reset_restarts_the_after_quiet_timer() {
     let registry = JobRegistry::from_current();
     let (job, starts, _) = SpyJob::new(
-        JobKey::HeartbeatCountdown,
+        JobKey::ElectionCountdown,
         Trigger::AfterQuiet((PERIOD..=PERIOD).into()),
     );
     registry.register_and_start(Arc::new(job));
@@ -179,7 +179,7 @@ async fn reset_restarts_the_after_quiet_timer() {
     settle().await;
     assert_eq!(starts.load(Ordering::SeqCst), 0);
 
-    registry.reset(JobKey::HeartbeatCountdown);
+    registry.reset(JobKey::ElectionCountdown);
     settle().await;
 
     tokio::time::advance(PERIOD - Duration::from_millis(1)).await;
@@ -194,7 +194,7 @@ async fn reset_restarts_the_after_quiet_timer() {
     settle().await;
     assert_eq!(starts.load(Ordering::SeqCst), 1);
 
-    registry.stop(JobKey::HeartbeatCountdown).await;
+    registry.stop(JobKey::ElectionCountdown).await;
 }
 
 const MIN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -204,7 +204,7 @@ const MAX_TIMEOUT: Duration = Duration::from_millis(150);
 async fn after_quiet_fires_within_the_range() {
     let registry = JobRegistry::from_current();
     let (job, starts, _) = SpyJob::new(
-        JobKey::HeartbeatCountdown,
+        JobKey::ElectionCountdown,
         Trigger::AfterQuiet((MIN_TIMEOUT..=MAX_TIMEOUT).into()),
     );
     registry.register_and_start(Arc::new(job));
@@ -232,14 +232,14 @@ async fn after_quiet_fires_within_the_range() {
         "the deadline must fire by the maximum"
     );
 
-    registry.stop(JobKey::HeartbeatCountdown).await;
+    registry.stop(JobKey::ElectionCountdown).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn reset_redraws_the_after_quiet_deadline() {
     let registry = JobRegistry::from_current();
     let (job, starts, _) = SpyJob::new(
-        JobKey::HeartbeatCountdown,
+        JobKey::ElectionCountdown,
         Trigger::AfterQuiet((MIN_TIMEOUT..=MAX_TIMEOUT).into()),
     );
     registry.register_and_start(Arc::new(job));
@@ -251,7 +251,7 @@ async fn reset_redraws_the_after_quiet_deadline() {
 
     // `MAX_TIMEOUT < 2 * MIN_TIMEOUT`, so without a fresh delay the original
     // deadline would have fired by the next checkpoint.
-    registry.reset(JobKey::HeartbeatCountdown);
+    registry.reset(JobKey::ElectionCountdown);
     settle().await;
     tokio::time::advance(MIN_TIMEOUT - Duration::from_millis(1)).await;
     settle().await;
@@ -269,20 +269,20 @@ async fn reset_redraws_the_after_quiet_deadline() {
         "the redrawn deadline must fire by the maximum"
     );
 
-    registry.stop(JobKey::HeartbeatCountdown).await;
+    registry.stop(JobKey::ElectionCountdown).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn stop_freezes_a_repeating_job() {
     let registry = JobRegistry::from_current();
-    let (job, starts, _) = SpyJob::new(JobKey::HeartbeatPush, Trigger::Every(PERIOD));
+    let (job, starts, _) = SpyJob::new(JobKey::HeartbeatPooling, Trigger::Every(PERIOD));
     registry.register_and_start(Arc::new(job));
     settle().await;
 
     let before_stop = starts.load(Ordering::SeqCst);
     assert!(before_stop > 0);
 
-    registry.stop(JobKey::HeartbeatPush).await;
+    registry.stop(JobKey::HeartbeatPooling).await;
     settle().await;
     tokio::time::advance(PERIOD * 5).await;
     settle().await;
@@ -293,14 +293,14 @@ async fn stop_freezes_a_repeating_job() {
 #[tokio::test]
 async fn stop_aborts_a_running_job() {
     let registry = JobRegistry::from_current();
-    let (job, starts, ticks) = SpyJob::looping(JobKey::HeartbeatPush, Trigger::Once);
+    let (job, starts, ticks) = SpyJob::looping(JobKey::HeartbeatPooling, Trigger::Once);
     registry.register_and_start(Arc::new(job));
     settle().await;
 
     assert_eq!(starts.load(Ordering::SeqCst), 1);
     assert!(ticks.load(Ordering::SeqCst) > 0);
 
-    registry.stop(JobKey::HeartbeatPush).await;
+    registry.stop(JobKey::HeartbeatPooling).await;
     settle().await;
     let after_stop = ticks.load(Ordering::SeqCst);
     settle().await;
@@ -310,53 +310,53 @@ async fn stop_aborts_a_running_job() {
         after_stop,
         "the spawned task must be aborted"
     );
-    assert!(!registry.is_running(JobKey::HeartbeatPush));
-    assert!(!registry.is_registered(JobKey::HeartbeatPush));
+    assert!(!registry.is_running(JobKey::HeartbeatPooling));
+    assert!(!registry.is_registered(JobKey::HeartbeatPooling));
 }
 
 #[tokio::test]
 async fn stop_is_idempotent() {
     let registry = JobRegistry::from_current();
-    let (job, starts, _) = SpyJob::looping(JobKey::HeartbeatPush, Trigger::Once);
+    let (job, starts, _) = SpyJob::looping(JobKey::HeartbeatPooling, Trigger::Once);
     registry.register_and_start(Arc::new(job));
     settle().await;
 
-    registry.stop(JobKey::HeartbeatPush).await;
-    registry.stop(JobKey::HeartbeatPush).await;
+    registry.stop(JobKey::HeartbeatPooling).await;
+    registry.stop(JobKey::HeartbeatPooling).await;
 
     assert_eq!(starts.load(Ordering::SeqCst), 1);
-    assert!(!registry.is_registered(JobKey::HeartbeatPush));
-    assert!(!registry.is_running(JobKey::HeartbeatPush));
+    assert!(!registry.is_registered(JobKey::HeartbeatPooling));
+    assert!(!registry.is_running(JobKey::HeartbeatPooling));
 }
 
 #[tokio::test]
 async fn stop_before_start_unregisters_the_job() {
     let registry = JobRegistry::from_current();
-    let (job, starts, _) = SpyJob::new(JobKey::HeartbeatPush, Trigger::Once);
+    let (job, starts, _) = SpyJob::new(JobKey::HeartbeatPooling, Trigger::Once);
     registry.register(Arc::new(job));
 
-    registry.stop(JobKey::HeartbeatPush).await;
+    registry.stop(JobKey::HeartbeatPooling).await;
     settle().await;
 
     assert_eq!(starts.load(Ordering::SeqCst), 0);
-    assert!(!registry.is_registered(JobKey::HeartbeatPush));
-    assert!(!registry.is_running(JobKey::HeartbeatPush));
+    assert!(!registry.is_registered(JobKey::HeartbeatPooling));
+    assert!(!registry.is_running(JobKey::HeartbeatPooling));
 }
 
 #[tokio::test]
 async fn reset_without_a_running_job_is_ignored() {
     let registry = JobRegistry::from_current();
     let (job, starts, _) = SpyJob::new(
-        JobKey::HeartbeatCountdown,
+        JobKey::ElectionCountdown,
         Trigger::AfterQuiet((PERIOD..=PERIOD).into()),
     );
     registry.register(Arc::new(job));
 
-    registry.reset(JobKey::HeartbeatCountdown);
+    registry.reset(JobKey::ElectionCountdown);
     settle().await;
 
     assert_eq!(starts.load(Ordering::SeqCst), 0);
-    assert!(registry.is_registered(JobKey::HeartbeatCountdown));
+    assert!(registry.is_registered(JobKey::ElectionCountdown));
 }
 
 #[tokio::test]
